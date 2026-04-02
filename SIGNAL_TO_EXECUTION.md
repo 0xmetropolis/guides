@@ -343,3 +343,62 @@ if self.is_expired:
 | `FAILED` | Max retries exceeded while trying to place/fill orders |
 
 Once a barrier triggers, the executor transitions to `RunnableStatus.SHUTTING_DOWN`.
+
+---
+
+## 6. Position Close & PnL
+
+When a barrier triggers, `place_close_order_and_cancel_open_orders()` (line 472) is called:
+
+1. Any open limit orders (e.g. a resting TP limit) are cancelled
+2. A market close order is placed for `amount_to_close` (`open_filled_amount − close_filled_amount`)
+3. `close_type` is set (e.g. `STOP_LOSS`)
+4. `close_timestamp` is recorded
+5. Status transitions to `RunnableStatus.SHUTTING_DOWN`
+
+**Log to expect (debug):**
+```
+Executor ID: <uuid> - Placing close order <order_id> --> Filled amount: <amount>
+```
+
+While shutting down, `control_shutdown_process()` (line 318) waits for all in-flight orders to complete. While it waits:
+
+```
+Waiting for close order to be filled
+```
+
+Once `all_orders_completed()` returns `True` and the open and close volumes match, `self.stop()` is called, transitioning the executor to `RunnableStatus.TERMINATED`. At this point hummingbot-api persists the executor record to PostgreSQL.
+
+**Log on close order failure:**
+```
+Close order failed <order_id>. Retrying <n>/10
+```
+
+### Querying results via the API
+
+All endpoints are relative to the hummingbot-api base URL.
+
+**Full executor detail** — config, fill prices, `close_type`, `realized_pnl`, fees, timestamps:
+```
+GET /executors/{executor_id}
+```
+
+**Aggregate performance** — win rate, total PnL, Sharpe ratio, per-`close_type` breakdown:
+```
+GET /executors/performance
+```
+
+**Status overview** — executor counts by status:
+```
+GET /executors/summary
+```
+
+**Filtered search** — query by controller, connector, pair, status, date range:
+```
+POST /executors/search
+```
+
+**Bot log lines for a specific executor:**
+```
+GET /executors/{executor_id}/logs
+```
