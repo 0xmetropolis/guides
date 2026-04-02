@@ -274,3 +274,72 @@ Once `_open_order.is_filled` is `True`, `open_filled_amount > 0`, and the positi
 ```
 Open order failed <order_id>. Retrying <n>/10
 ```
+
+---
+
+## 5. Position Monitoring
+
+After the entry fill, `control_barriers()` (line 457) runs on every tick:
+
+```python
+def control_barriers(self):
+    if self._open_order.is_filled
+            and open_filled_amount >= min_order_size
+            and open_filled_amount_quote >= min_notional_size:
+        self.control_stop_loss()
+        if self.status == RunnableStatus.RUNNING:
+            self.control_trailing_stop()
+            self.control_take_profit()
+    self.control_time_limit()   # always checked, even before the fill
+```
+
+### Stop loss (line 510)
+
+Checks `net_pnl_pct` (unrealised PnL as a fraction of position value) on every tick:
+
+```python
+if self.net_pnl_pct <= -self.config.triple_barrier_config.stop_loss:
+    self.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
+```
+
+Uses a market close order. Evaluated before TP, so a large adverse move that crosses both barriers exits as `STOP_LOSS`.
+
+### Take profit (line 521)
+
+Two modes depending on `take_profit_order_type`:
+
+- **`LIMIT`** (default for `ai_livestream`): places a resting limit order at `take_profit_price` once the price is within activation bounds. Cancels and replaces if partially filled. When the limit order fills, `close_type` is set to `TAKE_PROFIT` and the executor begins shutting down.
+- **`MARKET`**: triggered when `net_pnl_pct >= take_profit`, places a market close order immediately.
+
+**Log when TP limit order is placed (debug):**
+```
+Executor ID: <uuid> - Placing take profit order <order_id>
+```
+
+**Log when TP limit order is renewed due to partial fill (debug):**
+```
+Renewing take profit order
+```
+
+### Time limit (line 545)
+
+```python
+if self.is_expired:
+    self.place_close_order_and_cancel_open_orders(close_type=CloseType.TIME_LIMIT)
+```
+
+`is_expired` is `True` when `current_timestamp − config.timestamp > time_limit` (default 2700 seconds / 45 minutes). This barrier is checked on every tick regardless of fill status — an executor that never fills will expire and stop cleanly. Uses a market close order.
+
+### Close type reference
+
+| `CloseType` | Trigger |
+|-------------|---------|
+| `TAKE_PROFIT` | TP barrier hit (limit filled or market triggered) |
+| `STOP_LOSS` | SL barrier hit |
+| `TIME_LIMIT` | Position held past the time limit |
+| `EARLY_STOP` | Manual stop via API (`POST /executors/{id}/stop`) |
+| `EXPIRED` | Executor created after its own `timestamp + time_limit` had already passed |
+| `POSITION_HOLD` | Stopped with `keep_position=True`; open fill is kept as a held position |
+| `FAILED` | Max retries exceeded while trying to place/fill orders |
+
+Once a barrier triggers, the executor transitions to `RunnableStatus.SHUTTING_DOWN`.
