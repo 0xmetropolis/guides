@@ -161,3 +161,71 @@ The full payload is stored in `processed_data["features"]` so downstream compone
 > ```python
 > self.logger().info(f"Received ML signal: {signal}")
 > ```
+
+---
+
+## 3. Executor Creation
+
+`processed_data["signal"]` is read on every controller tick by `create_actions_proposal()` in `DirectionalTradingControllerBase` (line 167 of `directional_trading_controller_base.py`):
+
+```python
+signal = self.processed_data["signal"]
+if signal != 0 and self.can_create_executor(signal):
+    price = self.market_data_provider.get_price_by_type(
+        self.config.connector_name,
+        self.config.trading_pair,
+        PriceType.MidPrice,
+    )
+    amount = self.config.total_amount_quote / price / Decimal(self.config.max_executors_per_side)
+    trade_type = TradeType.BUY if signal > 0 else TradeType.SELL
+    create_actions.append(CreateExecutorAction(
+        controller_id=self.config.id,
+        executor_config=self.get_executor_config(trade_type, price, amount),
+    ))
+```
+
+### Gate: `can_create_executor`
+
+Before creating an executor, two conditions are checked (line 185):
+
+1. **Active executor cap:** The number of currently active executors on the same side must be below `max_executors_per_side` (default: 2).
+2. **Cooldown:** At least `cooldown_time` seconds (default: 300) must have elapsed since the last executor on that side closed or was created.
+
+If either condition fails, the signal is silently skipped until the next tick. This prevents the bot from stacking positions on every incoming signal.
+
+### `PositionExecutorConfig`
+
+When both conditions pass, `get_executor_config()` in `ai_livestream.py` (line 60) builds the config:
+
+```python
+PositionExecutorConfig(
+    timestamp=self.market_data_provider.time(),
+    connector_name=self.config.connector_name,   # e.g. "hyperliquid_perpetual"
+    trading_pair=self.config.trading_pair,        # e.g. "DOGE-USD"
+    side=trade_type,                              # TradeType.BUY or SELL
+    entry_price=price,                            # current mid price
+    amount=amount,                                # total_amount_quote / price / max_executors_per_side
+    triple_barrier_config=self.config.triple_barrier_config.new_instance_with_adjusted_volatility(
+        volatility_factor=self.processed_data["features"].get("target_pct", 0.01),
+    ),
+    leverage=self.config.leverage,
+)
+```
+
+### `target_pct` scaling
+
+`target_pct` from the signal is passed to `new_instance_with_adjusted_volatility()`, which multiplies the configured `take_profit` and `stop_loss` percentages by this factor:
+
+```
+actual_take_profit = config.take_profit × target_pct
+actual_stop_loss   = config.stop_loss   × target_pct
+```
+
+Example with `take_profit=0.02`, `stop_loss=0.03`, `target_pct=0.0187`:
+
+```
+TP = 0.02 × 0.0187 = 0.000374  (~0.037% from entry)
+SL = 0.03 × 0.0187 = 0.000561  (~0.056% from entry)
+```
+
+This makes exits tighter when the model sees low volatility and wider when it sees high. If `target_pct` is missing from the payload (e.g. malformed message), the executor falls back to `0.01` as a safe default.
