@@ -229,3 +229,48 @@ SL = 0.03 × 0.0187 = 0.000561  (~0.056% from entry)
 ```
 
 This makes exits tighter when the model sees low volatility and wider when it sees high. If `target_pct` is missing from the payload (e.g. malformed message), the executor falls back to `0.01` as a safe default.
+
+---
+
+## 4. Order Placement
+
+Once the executor is created, it enters `RunnableStatus.RUNNING`. On each update tick (every 1 second by default), `control_task()` calls `control_open_order()` (line 394 of `position_executor.py`).
+
+### Entry order
+
+`place_open_order()` (line 439) submits a **market order** to the exchange connector:
+
+```python
+order_id = self.place_order(
+    connector_name=self.config.connector_name,
+    trading_pair=self.config.trading_pair,
+    order_type=OrderType.MARKET,        # always MARKET for directional entries
+    amount=self.config.amount,
+    price=self.entry_price,
+    side=self.config.side,              # BUY or SELL
+    position_action=PositionAction.OPEN,
+)
+self._open_order = TrackedOrder(order_id=order_id)
+```
+
+**Log to expect (debug level):**
+```
+Executor ID: <uuid> - Placing open order <order_id>
+```
+
+### Order event tracking
+
+As the connector fires events, the executor updates its internal state:
+
+| Event | Handler | Effect |
+|-------|---------|--------|
+| `BuyOrderCreatedEvent` / `SellOrderCreatedEvent` | `process_order_created_event` | Links the exchange order ID to `_open_order` |
+| `OrderFilledEvent` | `process_order_filled_event` | Updates filled amounts on `_open_order` |
+| `BuyOrderCompletedEvent` / `SellOrderCompletedEvent` | `process_order_completed_event` | Marks `_open_order.is_done = True` |
+
+Once `_open_order.is_filled` is `True`, `open_filled_amount > 0`, and the position size exceeds both `min_order_size` and `min_notional_size` from the connector's trading rules, the executor transitions to barrier monitoring on the next tick.
+
+**Log on order failure (retries up to `max_retries`, default 10):**
+```
+Open order failed <order_id>. Retrying <n>/10
+```
