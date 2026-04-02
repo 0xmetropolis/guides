@@ -92,3 +92,72 @@ Every `monitoring_log_interval` seconds (default 60s), a heartbeat is also print
 ```
 Prediction heartbeat trading_pair=DOGE-USD signal=long signal_age=4.2s decision=long opportunity published (short=0.120, long=0.700, thresholds short>0.500 long>0.500) target_pct=0.0187
 ```
+
+---
+
+## 2. The Controller Receives It
+
+The bot runs the `ai_livestream` controller, defined in:
+
+```
+hummingbot-api/bots/controllers/directional_trading/ai_livestream.py
+```
+
+### Subscription setup
+
+When the controller initialises, `_init_ml_signal_listener()` (line 30) subscribes to the signal topic:
+
+```python
+normalized_pair = self.config.trading_pair.replace("-", "_").lower()
+topic = f"{self.config.topic}/{normalized_pair}/ML_SIGNALS"
+self._ml_signal_listener = ExternalTopicFactory.create_async(
+    topic=topic,
+    callback=self._handle_ml_signal,
+    use_bot_prefix=False,
+)
+```
+
+`ExternalTopicFactory.create_async` registers an async MQTT listener through hummingbot's internal MQTT interface. `use_bot_prefix=False` means the topic is used verbatim — no bot-ID prefix is prepended, which is what allows a single model to feed multiple bots subscribed to the same topic.
+
+**Log on successful startup:**
+```
+ML signal listener initialized successfully
+```
+
+**Log on failure (e.g. broker unreachable at init time):**
+```
+Failed to initialize ML signal listener: <error message>
+```
+
+### Decision logic
+
+Each time a message arrives, `_handle_ml_signal()` (line 45) fires:
+
+```python
+def _handle_ml_signal(self, signal: dict, topic: str):
+    short, neutral, long = signal["probabilities"]
+    if short > self.config.short_threshold:
+        self.processed_data["signal"] = -1
+    elif long > self.config.long_threshold:
+        self.processed_data["signal"] = 1
+    else:
+        self.processed_data["signal"] = 0
+    self.processed_data["features"] = signal
+```
+
+The controller applies its own `short_threshold` and `long_threshold` (both default `0.5`). These are marked `is_updatable`, meaning they can be changed via the API while the bot is running without a restart.
+
+| Condition | `processed_data["signal"]` | Meaning |
+|-----------|---------------------------|---------|
+| `short_prob > short_threshold` | `-1` | Open short |
+| `long_prob > long_threshold` | `1` | Open long |
+| Neither | `0` | Stay flat |
+
+Note that `short` is evaluated first — if both probabilities exceed their thresholds simultaneously, a short takes precedence.
+
+The full payload is stored in `processed_data["features"]` so downstream components (`get_executor_config`, `to_format_status`) can access `target_pct` and other fields.
+
+> **Tip:** The per-signal log line is commented out in the current code (line 47). To see every incoming payload in the bot log, uncomment:
+> ```python
+> self.logger().info(f"Received ML signal: {signal}")
+> ```
