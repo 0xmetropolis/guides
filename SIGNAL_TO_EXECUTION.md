@@ -283,9 +283,9 @@ After the entry fill, `control_barriers()` (line 457) runs on every tick:
 
 ```python
 def control_barriers(self):
-    if self._open_order.is_filled
+    if (self._open_order.is_filled
             and open_filled_amount >= min_order_size
-            and open_filled_amount_quote >= min_notional_size:
+            and open_filled_amount_quote >= min_notional_size):
         self.control_stop_loss()
         if self.status == RunnableStatus.RUNNING:
             self.control_trailing_stop()
