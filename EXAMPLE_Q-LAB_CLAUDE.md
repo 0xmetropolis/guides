@@ -16,7 +16,6 @@ When generating backtests for trading strategies, follow these rules.
 - **Take profit**: `take_profit_multiplier * target_pct`. Default multiplier = `1.0` (TP equals the predicted move).
 - **Stop loss**: Fixed at 3%. Not scaled by `target_pct`.
 - **Time limit**: 24h.
-- **Position size**: 10% of portfolio balance.
 
 ### Price Levels
 
