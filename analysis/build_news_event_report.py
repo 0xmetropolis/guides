@@ -22,52 +22,56 @@ OUT = Path(__file__).parent / "news_attribution_2026-04-25_26.html"
 EVENTS = [
     {
         "id": "E1",
-        "title": "Saturday morning rally — Trump cancels Iran envoys",
-        "start": "2026-04-25 06:00",
-        "end": "2026-04-25 12:00",
-        "anchor_time": "2026-04-25 08:00",
+        "title": "Saturday noon rally — Trump cancels Iran envoys",
+        "start": "2026-04-25 09:00",
+        "end": "2026-04-25 14:00",
+        "anchor_time": "2026-04-25 12:00",
         "direction": "UP",
         "narrative": (
-            "Saturday morning ET, Trump cancelled the Witkoff/Kushner trip to Islamabad "
-            "(\"too much time wasted\", \"we have all the cards\"). Iran's negotiator had "
-            "left Pakistan an hour earlier with no breakthrough — diplomatic-progress "
+            "Saturday around midday ET, Trump cancelled the Witkoff/Kushner trip to "
+            "Islamabad (\"too much time wasted\", \"we have all the cards\"). Iran's "
+            "negotiator had left Pakistan with no breakthrough — diplomatic-progress "
             "narrative dies. Bullish for oil because the path-to-Hormuz-reopening just "
-            "got longer. The sharp leg ran 08:00–10:00 ET on all three venues."
+            "got longer. HL Brent went 100.42 → <strong>102.20</strong> high during the "
+            "11:00–13:00 ET window, with the peak hour (Sat 12:00 ET) carrying the "
+            "highest weekend volume up to that point — ~$9 M notional on HL alone."
         ),
     },
     {
         "id": "E2",
-        "title": "Sunday afternoon rally — Iran's \"Hormuz will not reopen\" statement",
-        "start": "2026-04-26 12:00",
-        "end": "2026-04-26 17:30",
-        "anchor_time": "2026-04-26 14:00",
-        "direction": "UP",
+        "title": "Sunday morning–noon drop — Iran diplomatic outreach",
+        "start": "2026-04-26 07:00",
+        "end": "2026-04-26 13:00",
+        "anchor_time": "2026-04-26 11:00",
+        "direction": "DOWN",
         "narrative": (
-            "Iran's Deputy Parliament Speaker Ali Nikzad: <em>\"the Strait of Hormuz will "
-            "not return to its previous state under any circumstances.\"</em> CNN's piece "
-            "with this quote published 18:23 ET, but the wire-services reaction in oil "
-            "markets started ~14:00 ET, suggesting an earlier wire pickup. Hawkish Iran → "
-            "bullish oil. Same day Iran's FM Araghchi was meeting Oman's Sultan in Muscat "
-            "to discuss Hormuz transit, which the markets evidently did not read as a "
-            "softening signal."
+            "Sunday morning Iran's FM Araghchi met Oman's Sultan in Muscat to discuss "
+            "Hormuz transit, and reports started circulating that Iran was preparing a "
+            "proposal to reopen the strait in exchange for the US lifting its blockade. "
+            "If the talks were going to land, that would mean tankers moving again → "
+            "bearish for the war-tight oil bid. HL Brent went 101.10 → "
+            "<strong>100.23</strong> low across 09:00–12:00 ET, with most of the move "
+            "concentrated in the 11:00–12:00 ET hours."
         ),
     },
     {
         "id": "E3",
-        "title": "Sunday evening drop — CME reopen + Iran proposal leak",
-        "start": "2026-04-26 17:00",
-        "end": "2026-04-26 22:00",
-        "anchor_time": "2026-04-26 18:00",
-        "direction": "DOWN",
+        "title": "Sunday late-afternoon rally — \"Hormuz will not reopen\" + CME reopen",
+        "start": "2026-04-26 15:00",
+        "end": "2026-04-26 19:00",
+        "anchor_time": "2026-04-26 17:00",
+        "direction": "UP",
         "narrative": (
-            "Two simultaneous mechanisms at 18:00 ET Sunday: (a) <strong>CME Globex "
-            "reopens</strong> for the new trading week — same mean-reversion-to-oracle "
-            "pattern flagged in last weekend's analysis; (b) Axios/Bloomberg start "
-            "circulating <strong>Iran's new proposal</strong> to reopen Hormuz in exchange "
-            "for the US blockade lifting and deferring nuclear talks. Either is bearish "
-            "by itself; together they explain a $0.9 drop in 90 minutes. By Monday Asia "
-            "open Trump rejected the proposal and Brent gapped UP to $108 — but during "
-            "this Sunday-evening window, the venue data only sees the bearish leg."
+            "Two reinforcing mechanisms hit at the end of the collection window. "
+            "<strong>(a)</strong> Iran's Deputy Parliament Speaker Ali Nikzad: "
+            "<em>\"the Strait of Hormuz will not return to its previous state under any "
+            "circumstances.\"</em> CNN published this 18:23 ET; the wire reaction in "
+            "oil markets started ~17:00 ET, consistent with an earlier wire pickup. "
+            "Hawkish Iran → bullish oil. <strong>(b)</strong> CME Globex reopens at "
+            "18:00 ET for the new trading week, with CME Brent already at $107+ — the "
+            "perp venues had been trading $5+ below CME, so the reopen creates upward "
+            "arb pressure. HL Brent went 100.45 → <strong>101.69</strong> high in "
+            "17:00–18:00 ET, on the biggest hour of the weekend ($15.6 M HL notional)."
         ),
     },
 ]
@@ -87,7 +91,8 @@ con.execute(
     CREATE OR REPLACE VIEW trades AS
     SELECT venue, asset_symbol, side, price, size, notional_usd,
            mark_price, oracle_price,
-           to_timestamp(timestamp/1000.0) - INTERVAL 4 HOUR AS ts_et,
+           maker_user_address, taker_user_address,
+           (to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York') AS ts_et,
            timestamp AS ts_ms
     FROM read_parquet('{DATA_GLOB}', union_by_name=true)
     """
@@ -129,9 +134,11 @@ def candles_5m(venue, symbol, start, end):
 
 
 def big_trades(venue, symbol, start, end, top_n=15):
+    # maker/taker addresses are HL-only (null on Extended/Binance per schema.py).
     return con.execute(
         """
-        SELECT ts_et, side, price, notional_usd
+        SELECT ts_et, side, price, notional_usd,
+               maker_user_address, taker_user_address
         FROM trades
         WHERE venue = ? AND asset_symbol = ?
           AND ts_et >= ?::TIMESTAMP AND ts_et < ?::TIMESTAMP
@@ -139,6 +146,12 @@ def big_trades(venue, symbol, start, end, top_n=15):
         """,
         [venue, symbol, start, end, top_n],
     ).df()
+
+
+def short_addr(a):
+    if a is None or (isinstance(a, float)) or a == "":
+        return "—"
+    return f"{a[:6]}…{a[-4:]}"
 
 
 def event_figure(event):
@@ -160,6 +173,7 @@ def event_figure(event):
         ),
     )
 
+    # First pass: candles/volume/imbalance/gap
     for venue in VENUES:
         sym = SYMBOL_BY_VENUE[venue]
         d = candles_5m(venue, sym, event["start"], event["end"])
@@ -192,24 +206,60 @@ def event_figure(event):
             row=4, col=1,
         )
 
-        # Big trades on row 1 — mark only top 5 per venue to avoid clutter
+    # Second pass: collect ALL big trades across venues, sort by notional, label A/B/C…
+    big_rows = []
+    for venue in VENUES:
+        sym = SYMBOL_BY_VENUE[venue]
         bt = big_trades(venue, sym, event["start"], event["end"], top_n=5)
-        if not bt.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=bt["ts_et"], y=bt["price"], mode="markers",
-                    name=f"{venue} top trades",
-                    marker=dict(
-                        size=bt["notional_usd"].apply(lambda v: max(8, min(28, v / 5000))),
-                        color=color, opacity=0.6,
-                        line=dict(color="white", width=1),
-                    ),
-                    text=[f"{r.side} ${r.notional_usd:,.0f}" for r in bt.itertuples()],
-                    legendgroup=venue, showlegend=False,
-                    hovertemplate="%{x}<br>%{text}<br>price %{y:.3f}<extra>" + venue + "</extra>",
+        for r in bt.itertuples():
+            big_rows.append({
+                "venue": venue, "asset": sym,
+                "ts_et": r.ts_et, "side": r.side,
+                "price": float(r.price),
+                "notional": float(r.notional_usd),
+                "maker": r.maker_user_address or "",
+                "taker": r.taker_user_address or "",
+            })
+    big_rows.sort(key=lambda x: -x["notional"])
+    for i, row in enumerate(big_rows):
+        # 26 letters A-Z; if more, fall back to AA, AB…
+        row["letter"] = chr(ord("A") + i) if i < 26 else f"A{chr(ord('A') + i - 26)}"
+
+    # Third pass: plot labelled scatter per venue (so colour matches)
+    for venue in VENUES:
+        rows = [r for r in big_rows if r["venue"] == venue]
+        if not rows:
+            continue
+        color = VENUE_COLORS[venue]
+        fig.add_trace(
+            go.Scatter(
+                x=[r["ts_et"] for r in rows],
+                y=[r["price"] for r in rows],
+                mode="markers+text",
+                name=f"{venue} top trades",
+                text=[r["letter"] for r in rows],
+                textposition="top center",
+                textfont=dict(size=12, color="#111", family="-apple-system, sans-serif"),
+                marker=dict(
+                    size=[max(10, min(30, r["notional"] / 5000)) for r in rows],
+                    color=color, opacity=0.55,
+                    line=dict(color="white", width=1),
                 ),
-                row=1, col=1,
-            )
+                customdata=[
+                    [r["letter"], r["side"], r["notional"], r["maker"] or "—", r["taker"] or "—"]
+                    for r in rows
+                ],
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b> · %{x|%a %H:%M:%S ET}<br>"
+                    "%{customdata[1]} $%{customdata[2]:,.0f}<br>"
+                    "maker %{customdata[3]}<br>"
+                    "taker %{customdata[4]}<br>"
+                    "price %{y:.3f}<extra>" + venue + "</extra>"
+                ),
+                legendgroup=venue, showlegend=False,
+            ),
+            row=1, col=1,
+        )
 
     # Mark anchor time
     anchor = event["anchor_time"]
@@ -234,7 +284,35 @@ def event_figure(event):
     fig.update_yaxes(title_text="$", row=2, col=1)
     fig.update_yaxes(title_text="%", row=3, col=1)
     fig.update_yaxes(title_text="$ gap", row=4, col=1)
-    return fig
+    return fig, big_rows
+
+
+def big_trades_table(big_rows):
+    """Renders an HTML table mapping each labelled trade to its full info."""
+    if not big_rows:
+        return ""
+    head = (
+        "<table class='bigtrades'>"
+        "<thead><tr>"
+        "<th>Label</th><th>Venue</th><th>Time (ET)</th><th>Side</th>"
+        "<th style='text-align:right'>Price</th>"
+        "<th style='text-align:right'>Notional</th>"
+        "<th>Maker</th><th>Taker</th>"
+        "</tr></thead><tbody>"
+    )
+    body = "".join(
+        f"<tr><td><b>{r['letter']}</b></td>"
+        f"<td>{r['venue']}</td>"
+        f"<td>{pd.Timestamp(r['ts_et']).strftime('%a %Y-%m-%d %H:%M:%S')}</td>"
+        f"<td><span class='pill {r['side']}'>{r['side']}</span></td>"
+        f"<td style='text-align:right'>{r['price']:.3f}</td>"
+        f"<td style='text-align:right'>${r['notional']:,.0f}</td>"
+        f"<td><code>{r['maker'] or '—'}</code></td>"
+        f"<td><code>{r['taker'] or '—'}</code></td>"
+        "</tr>"
+        for r in big_rows
+    )
+    return head + body + "</tbody></table>"
 
 
 # ---- Lead/lag analysis ----
@@ -295,9 +373,10 @@ def lead_lag_text(event):
 # ---- Build figures ----
 event_blocks = []
 for ev in EVENTS:
-    fig = event_figure(ev)
+    fig, big_rows = event_figure(ev)
     ll = lead_lag_text(ev)
-    event_blocks.append((ev, fig, ll))
+    table = big_trades_table(big_rows)
+    event_blocks.append((ev, fig, ll, table))
 
 # Cross-event summary table — pre-event price, peak/trough, and net move per venue per event
 def summary_row(event, venue):
@@ -352,6 +431,16 @@ html = f"""<!doctype html>
   table.summary {{ border-collapse: collapse; margin: 1em 0; font-size: 0.9em; width: 100%; }}
   table.summary th, table.summary td {{ border: 1px solid #ddd; padding: 0.45em 0.7em; text-align: left; }}
   table.summary th {{ background: #f3f4f6; }}
+  .bigtrades-wrap {{ margin: 0.5em 0 2em; }}
+  .bigtrades-title {{ margin: 0.4em 0 0.4em; font-size: 0.95em; font-weight: 600; color: #333; }}
+  table.bigtrades {{ border-collapse: collapse; width: 100%; font-size: 0.82em; }}
+  table.bigtrades th, table.bigtrades td {{ border: 1px solid #e5e7eb; padding: 0.35em 0.6em; text-align: left; }}
+  table.bigtrades th {{ background: #f3f4f6; font-weight: 600; }}
+  table.bigtrades tr:nth-child(even) td {{ background: #fafbfc; }}
+  table.bigtrades code {{ font-size: 0.95em; background: transparent; word-break: break-all; }}
+  .pill {{ display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.85em; font-weight: 600; }}
+  .pill.buy {{ background: #d1fae5; color: #065f46; }}
+  .pill.sell {{ background: #fee2e2; color: #991b1b; }}
   .small {{ font-size: 0.78em; color: #666; }}
   .hyp {{ font-weight: 600; }}
   .verdict {{ display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.82em; font-weight: 700; margin-right: 6px; }}
@@ -387,15 +476,15 @@ all three venues, and the news drivers in this period are Brent-specific (Hormuz
 {summary_html}
 
 <div class="box warn">
-  <strong>Reading the table.</strong> Net % is intra-event open→close. The bigger story is
-  agreement across venues — all three move the same direction with similar magnitude on
-  E1 and E2, which rules out single-venue technicals. E3 is also cross-venue, but the lead/lag
-  analysis below shows a different signature.
+  <strong>Reading the table.</strong> Net % is intra-event open→close. All three events
+  show the <em>same direction</em> across HL/Extended/Binance with comparable magnitude —
+  this rules out single-venue technicals as the driver. E1 and E3 are pumps, E2 is a drop;
+  each tracks its respective news anchor.
 </div>
 
 """
 
-for ev, fig, ll in event_blocks:
+for ev, fig, ll, table in event_blocks:
     html += f"""
 <h2>{ev['id']} · {ev['title']}</h2>
 <div class="box">
@@ -407,6 +496,10 @@ for ev, fig, ll in event_blocks:
   {ll}
 </div>
 {to_div(fig)}
+<div class="bigtrades-wrap">
+<h4 class="bigtrades-title">Top trades — labelled A→… on the chart, full addresses below</h4>
+{table}
+</div>
 """
 
 html += """
@@ -418,11 +511,15 @@ html += """
   cancellation E1, Iran's Hormuz statement E2, Iran's reopen-proposal leak E3). The same
   direction and similar magnitude on all three venues confirms it's market-wide, not local.</p>
 
-  <p><span class="verdict v-supported">SUPPORTED</span><span class="hyp">H4 · CME-reopen mean-reversion contributed to E3.</span>
-  Sun 18:00 ET is exactly when CME Globex re-opens. Last weekend's report flagged the same
-  effect — n=2 now (limited but suggestive). The drop's <em>timing</em> aligns with reopen
-  to the minute; the proposal-leak news is a parallel mechanism. Hard to fully separate
-  without lower-frequency news-wire timestamps.</p>
+  <p><span class="verdict v-disproven">DISPROVEN (here)</span><span class="hyp">H4 · CME-reopen mean-reversion.</span>
+  An earlier draft of this report claimed Sun 18:00 ET was a <em>drop</em> driven by
+  mean reversion — that was a timezone bug in the data extraction (DuckDB session was in
+  Argentina <code>-03:00</code>, throwing every <code>EXTRACT(HOUR)</code> off by ~3 hours).
+  In true ET, Sun 18:00 ET is the <strong>peak</strong> of the weekend's biggest rally, not
+  a trough. CME does reopen at 18:00 ET, and there is upward arb pressure (perps were $5+
+  below CME's $107 close), but that's the opposite of mean reversion to a slow oracle.
+  The original CME-reopen-mean-reversion story from last weekend's notes still stands as a
+  hypothesis on its own merits — but this weekend does <strong>not</strong> support it.</p>
 
   <p><span class="verdict v-partial">PARTIAL</span><span class="hyp">H3 · Weekend overshoot vs oracle.</span>
   The mark-trade gap chart in each event shows whether trade price is running ahead/behind
@@ -456,8 +553,10 @@ html += """
       publication-time, not the underlying wire-pickup time. A specific news event can
       hit terminals 30+ minutes before a major outlet publishes. The "news anchor" lines
       are best-effort, not millisecond-precise.</li>
-    <li><strong>n = 1 weekend, again.</strong> The CME-reopen-mean-reversion hypothesis
-      now has n=2 (last weekend + this Sun 18:00 drop). Still nowhere near tradeable.</li>
+    <li><strong>n = 1 weekend.</strong> The CME-reopen-mean-reversion hypothesis still
+      has n=1 (last weekend only); this weekend's Sun 18:00 ET hour was actually the peak
+      of an upward move, so it doesn't add support. More weekends needed before any
+      structural claim is tradeable.</li>
     <li><strong>Trade-vs-mark gap is noisy on Brent venues.</strong> The mark-price feed
       from Hyperliquid for <code>xyz:BRENTOIL</code> is sparser than for <code>xyz:CL</code>,
       so the gap trace has gaps. WTI products would show this hypothesis cleaner (left

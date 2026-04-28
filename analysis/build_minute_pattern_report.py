@@ -3,19 +3,35 @@ Minute-of-hour pattern report — does anything special happen at :44/:45 of eac
 hour on the perp recorders? Tests against last full weekend (2026-04-25/26)
 since the actual crash weekend (04-18/19) was lost to OOM.
 
+Generates two HTML files:
+  - minute_of_hour_pattern_2026-04-25_26.html         (all weekend hours)
+  - minute_of_hour_pattern_2026-04-25_26_filtered.html (CME open/close hours
+    excluded — 17:00 ET maintenance hour and 18:00 ET Sunday reopen hour)
+
 Usage:
     uv run python build_minute_pattern_report.py
-    # writes minute_of_hour_pattern_2026-04-25_26.html in the same dir.
 """
 
 from pathlib import Path
 
 import duckdb
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-DATA_GLOB = "/Users/marcolavagnino/metal/hl-trades-recorder/data/**/2026-04-2[56]T*.parquet"
-OUT = Path(__file__).parent / "minute_of_hour_pattern_2026-04-25_26.html"
+# Recorder collection window (recorder/window.py): Fri 16:00 ET → Sun 19:00 ET
+# (Sunday hour < 19, exclusive). Files are ET-named per the README convention.
+WINDOW_START = "2026-04-24 16:00:00"
+WINDOW_END = "2026-04-26 19:00:00"
+DATA_GLOBS = [
+    # Friday 16:00–23:00 ET
+    "/Users/marcolavagnino/metal/hl-trades-recorder/data/**/2026-04-24T1[6-9]*.parquet",
+    "/Users/marcolavagnino/metal/hl-trades-recorder/data/**/2026-04-24T2[0-3]*.parquet",
+    # All of Saturday
+    "/Users/marcolavagnino/metal/hl-trades-recorder/data/**/2026-04-25T*.parquet",
+    # Sunday 00:00–18:00 ET
+    "/Users/marcolavagnino/metal/hl-trades-recorder/data/**/2026-04-26T0*.parquet",
+    "/Users/marcolavagnino/metal/hl-trades-recorder/data/**/2026-04-26T1[0-8]*.parquet",
+]
+OUT_DIR = Path(__file__).parent
 
 VENUE_COLORS = {
     "hyperliquid": "#7c3aed",
@@ -23,209 +39,239 @@ VENUE_COLORS = {
     "binance": "#f59e0b",
 }
 
-con = duckdb.connect()
+# CME WTI/Brent: daily 17:00–18:00 ET maintenance window; Sunday reopen at 18:00 ET.
+# Within our data range (Sat 00:00 → Sun ~21:00 ET) those hours are the only
+# market-driven events. Filtering them isolates "pure weekend" perp behaviour.
+MODES = [
+    {
+        "label": "all",
+        "exclude_hours": set(),
+        "out": OUT_DIR / "minute_of_hour_pattern_2026-04-25_26.html",
+        "title_suffix": "(all weekend hours)",
+    },
+    {
+        "label": "filtered",
+        "exclude_hours": {17, 18},
+        "out": OUT_DIR / "minute_of_hour_pattern_2026-04-25_26_filtered.html",
+        "title_suffix": "(CME open/close hours excluded — :17 and :18 ET hours dropped)",
+    },
+]
 
-# Reusable view over the weekend data, with minute-of-hour and ET hour-of-week
-# Trade timestamp is UTC ms. ET is UTC-4 in April (EDT).
-con.execute(
-    f"""
-    CREATE OR REPLACE VIEW trades AS
-    SELECT
-      venue,
-      asset_symbol,
-      side,
-      price,
-      size,
-      notional_usd,
-      mark_price,
-      oracle_price,
-      to_timestamp(timestamp/1000.0) AS ts_utc,
-      to_timestamp(timestamp/1000.0) - INTERVAL 4 HOUR AS ts_et,
-      EXTRACT(MINUTE FROM (to_timestamp(timestamp/1000.0) - INTERVAL 4 HOUR))::INT AS minute_of_hour,
-      EXTRACT(HOUR FROM (to_timestamp(timestamp/1000.0) - INTERVAL 4 HOUR))::INT AS hour_et,
-      EXTRACT(DAY FROM (to_timestamp(timestamp/1000.0) - INTERVAL 4 HOUR))::INT AS day_et,
-      timestamp AS ts_ms
-    FROM read_parquet('{DATA_GLOB}', union_by_name=true)
-    """
-)
 
-summary = con.execute(
-    """SELECT venue, asset_symbol, COUNT(*) AS rows,
-              MIN(ts_et) AS first_trade_et, MAX(ts_et) AS last_trade_et
-       FROM trades GROUP BY venue, asset_symbol ORDER BY venue, asset_symbol"""
-).df()
+def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
+    # Restrict to the recorder's intended collection window (Fri 16:00 ET →
+    # Sun 19:00 ET, exclusive). Bounds applied in SQL on the ET timestamp so
+    # this works regardless of file-name conventions.
+    where_parts = [
+        f"((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')) >= TIMESTAMP '{WINDOW_START}'",
+        f"((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')) <  TIMESTAMP '{WINDOW_END}'",
+    ]
+    if exclude_hours:
+        where_parts.append(
+            "EXTRACT(HOUR FROM ((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')))"
+            f" NOT IN ({','.join(str(h) for h in sorted(exclude_hours))})"
+        )
+    excl_clause = "WHERE " + " AND ".join(where_parts)
 
-# ---- Aggregates per (venue, minute_of_hour) ----
-agg = con.execute(
-    """SELECT venue,
-              minute_of_hour,
-              COUNT(*) AS trades,
-              SUM(notional_usd) AS notional,
-              AVG(notional_usd) AS avg_notional,
-              QUANTILE_CONT(notional_usd, 0.95) AS p95_notional,
-              SUM(CASE WHEN side='buy' THEN notional_usd ELSE 0 END) AS buy_notional,
-              SUM(CASE WHEN side='sell' THEN notional_usd ELSE 0 END) AS sell_notional,
-              AVG(CASE WHEN mark_price IS NOT NULL AND mark_price > 0
-                  THEN ABS(price - mark_price) END) AS avg_mark_gap,
-              QUANTILE_CONT(CASE WHEN mark_price IS NOT NULL AND mark_price > 0
-                  THEN ABS(price - mark_price) END, 0.5) AS median_mark_gap
-       FROM trades
-       GROUP BY venue, minute_of_hour
-       ORDER BY venue, minute_of_hour"""
-).df()
-agg["imbalance_pct"] = (
-    100.0 * (agg["buy_notional"] - agg["sell_notional"]) / (agg["buy_notional"] + agg["sell_notional"])
-)
+    globs_sql = "[" + ", ".join(f"'{g}'" for g in DATA_GLOBS) + "]"
 
-# ---- Hour-of-window cumulative for the HL recorder (the actual crash victim) ----
-hl_cum = con.execute(
-    """WITH ordered AS (
-         SELECT ts_et,
-                ROW_NUMBER() OVER (ORDER BY ts_ms) AS cum_rows
-         FROM trades WHERE venue='hyperliquid'
-       )
-       SELECT date_trunc('hour', ts_et) AS hour_et,
-              MAX(cum_rows) AS cum_rows_end_of_hour
-       FROM ordered
-       GROUP BY 1 ORDER BY 1"""
-).df()
+    con = duckdb.connect()
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW trades AS
+        SELECT
+          venue,
+          asset_symbol,
+          side,
+          price,
+          size,
+          notional_usd,
+          mark_price,
+          oracle_price,
+          to_timestamp(timestamp/1000.0) AS ts_utc,
+          (to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York') AS ts_et,
+          EXTRACT(MINUTE FROM ((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')))::INT AS minute_of_hour,
+          EXTRACT(HOUR FROM ((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')))::INT AS hour_et,
+          EXTRACT(DAY FROM ((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')))::INT AS day_et,
+          timestamp AS ts_ms
+        FROM read_parquet({globs_sql}, union_by_name=true)
+        {excl_clause}
+        """
+    )
 
-# ---- Per-flush cumulative reconstruction (the null hypothesis) ----
-# 5-min flushes land on :04, :09, :14, :19, :24, :29, :34, :39, :44, :49, :54, :59
-# (postmortem says first flush was at 13:34/:39/:44 UTC on 04-18, so :04+5k cadence)
-flush_minutes = [4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 54, 59]
-flush_cum = con.execute(
-    """WITH ordered AS (
-         SELECT ts_et,
-                EXTRACT(MINUTE FROM ts_et)::INT AS m,
-                ROW_NUMBER() OVER (ORDER BY ts_ms) AS cum_rows
-         FROM trades WHERE venue='hyperliquid'
-       ),
-       flush_pts AS (
-         SELECT date_trunc('hour', ts_et) AS hour_et, m AS minute,
-                MAX(cum_rows) AS rows_at_flush
-         FROM ordered
-         WHERE m IN (4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 54, 59)
-         GROUP BY 1, 2
-       )
-       SELECT * FROM flush_pts ORDER BY hour_et, minute"""
-).df()
+    summary = con.execute(
+        """SELECT venue, asset_symbol, COUNT(*) AS rows,
+                  MIN(ts_et) AS first_trade_et, MAX(ts_et) AS last_trade_et
+           FROM trades GROUP BY venue, asset_symbol ORDER BY venue, asset_symbol"""
+    ).df()
 
-# Rebuild a dense flush series across the window for the staircase chart
-flush_cum["t"] = flush_cum["hour_et"] + (flush_cum["minute"].astype("timedelta64[m]"))
+    agg = con.execute(
+        """SELECT venue,
+                  minute_of_hour,
+                  COUNT(*) AS trades,
+                  SUM(notional_usd) AS notional,
+                  AVG(notional_usd) AS avg_notional,
+                  QUANTILE_CONT(notional_usd, 0.95) AS p95_notional,
+                  SUM(CASE WHEN side='buy' THEN notional_usd ELSE 0 END) AS buy_notional,
+                  SUM(CASE WHEN side='sell' THEN notional_usd ELSE 0 END) AS sell_notional,
+                  AVG(CASE WHEN mark_price IS NOT NULL AND mark_price > 0
+                      THEN ABS(price - mark_price) END) AS avg_mark_gap,
+                  QUANTILE_CONT(CASE WHEN mark_price IS NOT NULL AND mark_price > 0
+                      THEN ABS(price - mark_price) END, 0.5) AS median_mark_gap
+           FROM trades
+           GROUP BY venue, minute_of_hour
+           ORDER BY venue, minute_of_hour"""
+    ).df()
+    agg["imbalance_pct"] = (
+        100.0 * (agg["buy_notional"] - agg["sell_notional"]) / (agg["buy_notional"] + agg["sell_notional"])
+    )
 
-# ---- Chart helpers ----
-def line_per_venue(metric, ylabel, title, hover_fmt=":,.0f"):
-    fig = go.Figure()
-    for venue in ["hyperliquid", "extended", "binance"]:
-        d = agg[agg["venue"] == venue].sort_values("minute_of_hour")
-        fig.add_trace(
-            go.Scatter(
-                x=d["minute_of_hour"], y=d[metric],
-                mode="lines+markers", name=venue,
-                line=dict(color=VENUE_COLORS[venue], width=2),
-                marker=dict(size=5),
-                hovertemplate="minute %{x:02d}<br>" + ylabel + f": %{{y{hover_fmt}}}<extra>{venue}</extra>",
+    flush_minutes = [4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 54, 59]
+    flush_cum = con.execute(
+        """WITH ordered AS (
+             SELECT ts_et,
+                    EXTRACT(MINUTE FROM ts_et)::INT AS m,
+                    ROW_NUMBER() OVER (ORDER BY ts_ms) AS cum_rows
+             FROM trades WHERE venue='hyperliquid'
+           ),
+           flush_pts AS (
+             SELECT date_trunc('hour', ts_et) AS hour_et, m AS minute,
+                    MAX(cum_rows) AS rows_at_flush
+             FROM ordered
+             WHERE m IN (4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 54, 59)
+             GROUP BY 1, 2
+           )
+           SELECT * FROM flush_pts ORDER BY hour_et, minute"""
+    ).df()
+    flush_cum["t"] = flush_cum["hour_et"] + (flush_cum["minute"].astype("timedelta64[m]"))
+
+    def line_per_venue(metric, ylabel, title, hover_fmt=":,.0f"):
+        fig = go.Figure()
+        for venue in ["hyperliquid", "extended", "binance"]:
+            d = agg[agg["venue"] == venue].sort_values("minute_of_hour")
+            fig.add_trace(
+                go.Scatter(
+                    x=d["minute_of_hour"], y=d[metric],
+                    mode="lines+markers", name=venue,
+                    line=dict(color=VENUE_COLORS[venue], width=2),
+                    marker=dict(size=5),
+                    hovertemplate="minute %{x:02d}<br>" + ylabel + f": %{{y{hover_fmt}}}<extra>{venue}</extra>",
+                )
+            )
+        fig.add_vrect(x0=43.5, x1=46.5, fillcolor="red", opacity=0.08, line_width=0,
+                      annotation_text=":44–:46", annotation_position="top left")
+        fig.update_layout(
+            title=title, xaxis_title="Minute of hour (ET)", yaxis_title=ylabel,
+            hovermode="x unified", template="plotly_white", height=380,
+            margin=dict(l=50, r=20, t=50, b=40),
+            xaxis=dict(tickmode="linear", tick0=0, dtick=5, range=[-0.5, 59.5]),
+        )
+        return fig
+
+    def heatmap_for(venue):
+        d = con.execute(
+            f"""SELECT dayname(ts_et) AS day_name,
+                       hour_et,
+                       minute_of_hour,
+                       COUNT(*) AS trades
+                FROM trades WHERE venue='{venue}'
+                GROUP BY 1, 2, 3"""
+        ).df()
+        # Sort key: collection-window order Friday → Saturday → Sunday
+        day_order = {"Friday": 0, "Saturday": 1, "Sunday": 2}
+        d["sort_key"] = d["day_name"].map(day_order).fillna(99) * 100 + d["hour_et"]
+        d["label"] = d["day_name"].str.slice(0, 3) + " " + d["hour_et"].apply(lambda h: f"{h:02d}:00")
+        d = d.sort_values("sort_key")
+        ordered_labels = d.drop_duplicates(subset=["label"]).sort_values("sort_key")["label"].tolist()
+        pivot = d.pivot_table(index="label", columns="minute_of_hour", values="trades", fill_value=0)
+        pivot = pivot.reindex(ordered_labels)
+        fig = go.Figure(
+            go.Heatmap(
+                z=pivot.values, x=pivot.columns, y=pivot.index,
+                colorscale="Viridis", colorbar=dict(title="trades"),
+                hovertemplate="%{y} :%{x:02d}<br>%{z} trades<extra></extra>",
             )
         )
-    fig.add_vrect(x0=43.5, x1=46.5, fillcolor="red", opacity=0.08, line_width=0,
-                  annotation_text=":44–:46", annotation_position="top left")
-    fig.update_layout(
-        title=title, xaxis_title="Minute of hour (ET)", yaxis_title=ylabel,
-        hovermode="x unified", template="plotly_white", height=380,
-        margin=dict(l=50, r=20, t=50, b=40),
-        xaxis=dict(tickmode="linear", tick0=0, dtick=5, range=[-0.5, 59.5]),
-    )
-    return fig
-
-def heatmap_for(venue):
-    d = con.execute(
-        f"""SELECT EXTRACT(DOW FROM ts_et)::INT AS dow_et,
-                   hour_et,
-                   minute_of_hour,
-                   COUNT(*) AS trades
-            FROM trades WHERE venue='{venue}'
-            GROUP BY 1, 2, 3"""
-    ).df()
-    # Build a matrix with rows = (dow, hour) merged label, cols = minute_of_hour
-    d["label"] = d["dow_et"].map({5: "Sat ", 6: "Sun "}).fillna("Mon ") + d["hour_et"].apply(lambda h: f"{h:02d}:00")
-    pivot = d.pivot_table(index="label", columns="minute_of_hour", values="trades", fill_value=0)
-    pivot = pivot.sort_index()
-    fig = go.Figure(
-        go.Heatmap(
-            z=pivot.values, x=pivot.columns, y=pivot.index,
-            colorscale="Viridis", colorbar=dict(title="trades"),
-            hovertemplate="%{y} :%{x:02d}<br>%{z} trades<extra></extra>",
+        fig.add_vline(x=44, line=dict(color="red", width=1, dash="dot"))
+        fig.add_vline(x=45, line=dict(color="red", width=1, dash="dot"))
+        excl_note = ""
+        if exclude_hours:
+            excl_note = f" — hours {sorted(exclude_hours)} ET excluded"
+        fig.update_layout(
+            title=f"{venue} · trades per (day-hour-ET × minute-of-hour) — red lines mark :44, :45{excl_note}",
+            xaxis_title="minute of hour", yaxis_title="day · hour (ET)",
+            height=600, template="plotly_white",
+            xaxis=dict(tickmode="linear", tick0=0, dtick=5),
+            yaxis=dict(autorange="reversed"),  # Sat 00 at top, Sun 23 at bottom
+            margin=dict(l=80, r=20, t=50, b=40),
         )
-    )
-    fig.add_vline(x=44, line=dict(color="red", width=1, dash="dot"))
-    fig.add_vline(x=45, line=dict(color="red", width=1, dash="dot"))
-    fig.update_layout(
-        title=f"{venue} · trades per (hour-ET × minute-of-hour) — red lines mark :44, :45",
-        xaxis_title="minute of hour", yaxis_title="hour (ET)",
-        height=600, template="plotly_white",
-        xaxis=dict(tickmode="linear", tick0=0, dtick=5),
-        margin=dict(l=80, r=20, t=50, b=40),
-    )
-    return fig
+        return fig
 
-def flush_staircase():
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=flush_cum["t"], y=flush_cum["rows_at_flush"],
-            mode="lines+markers",
-            line=dict(color="#7c3aed", width=1.5),
-            marker=dict(
-                size=6,
-                color=flush_cum["minute"].apply(lambda m: "red" if m == 44 else "#7c3aed"),
-            ),
-            text=flush_cum["minute"].apply(lambda m: f":{m:02d}"),
-            hovertemplate="%{x|%a %H:%M ET}<br>cum rows: %{y:,}<br>flush: %{text}<extra></extra>",
-            name="HL cumulative rows at each flush",
+    def flush_staircase():
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=flush_cum["t"], y=flush_cum["rows_at_flush"],
+                mode="lines+markers",
+                line=dict(color="#7c3aed", width=1.5),
+                marker=dict(
+                    size=6,
+                    color=flush_cum["minute"].apply(lambda m: "red" if m == 44 else "#7c3aed"),
+                ),
+                text=flush_cum["minute"].apply(lambda m: f":{m:02d}"),
+                hovertemplate="%{x|%a %H:%M ET}<br>cum rows: %{y:,}<br>flush: %{text}<extra></extra>",
+                name="HL cumulative rows at each flush",
+            )
         )
+        fig.add_hline(
+            y=136164, line=dict(color="red", width=1.5, dash="dash"),
+            annotation_text="136k rows = OOM line on 04-18 (256 MB cap)",
+            annotation_position="top left",
+        )
+        fig.update_layout(
+            title="Hyperliquid cumulative rows over the weekend, sampled at every flush boundary "
+                  "(:04, :09, …, :59). The :44 boundaries are highlighted in red — "
+                  "if OOM was triggered by total file size, the crash lands wherever the line "
+                  "crosses the dashed threshold, regardless of the hour.",
+            xaxis_title="Time (ET)", yaxis_title="Cumulative HL rows since first trade",
+            template="plotly_white", height=420, margin=dict(l=60, r=20, t=80, b=40),
+        )
+        return fig
+
+    fig_trades = line_per_venue("trades", "Trades", "Hypothesis 1: Trade-count burst by minute-of-hour")
+    fig_notional = line_per_venue("notional", "Notional (USD)", "Hypothesis 2: Notional volume by minute-of-hour")
+    fig_avg = line_per_venue("avg_notional", "Avg trade $", "Hypothesis 3a: Average trade size by minute-of-hour")
+    fig_p95 = line_per_venue("p95_notional", "p95 trade $", "Hypothesis 3b: p95 trade size (whales) by minute-of-hour")
+    fig_imb = line_per_venue("imbalance_pct", "Imbalance %", "Hypothesis 4: Buy/sell imbalance by minute-of-hour", hover_fmt=":+.1f")
+    fig_gap = line_per_venue("median_mark_gap", "Median |price−mark|", "Hypothesis 5: Mark-trade gap by minute-of-hour", hover_fmt=":,.4f")
+
+    heatmaps = {v: heatmap_for(v) for v in ["hyperliquid", "extended", "binance"]}
+    fig_flush = flush_staircase()
+
+    def to_div(fig):
+        return fig.to_html(include_plotlyjs=False, full_html=False, div_id=None)
+
+    summary_rows = "".join(
+        f"<tr><td>{row['venue']}</td><td>{row['asset_symbol']}</td>"
+        f"<td style='text-align:right'>{row['rows']:,}</td>"
+        f"<td>{row['first_trade_et']}</td><td>{row['last_trade_et']}</td></tr>"
+        for _, row in summary.iterrows()
     )
-    fig.add_hline(
-        y=136164, line=dict(color="red", width=1.5, dash="dash"),
-        annotation_text="136k rows = OOM line on 04-18 (256 MB cap)",
-        annotation_position="top left",
-    )
-    fig.update_layout(
-        title="Hyperliquid cumulative rows over the weekend, sampled at every flush boundary "
-              "(:04, :09, …, :59). The :44 boundaries are highlighted in red — "
-              "if OOM was triggered by total file size, the crash lands wherever the line "
-              "crosses the dashed threshold, regardless of the hour.",
-        xaxis_title="Time (ET)", yaxis_title="Cumulative HL rows since first trade",
-        template="plotly_white", height=420, margin=dict(l=60, r=20, t=80, b=40),
-    )
-    return fig
 
-# ---- Build figures ----
-fig_trades = line_per_venue("trades", "Trades", "Hypothesis 1: Trade-count burst by minute-of-hour")
-fig_notional = line_per_venue("notional", "Notional (USD)", "Hypothesis 2: Notional volume by minute-of-hour", hover_fmt=":,.0f")
-fig_avg = line_per_venue("avg_notional", "Avg trade $", "Hypothesis 3a: Average trade size by minute-of-hour", hover_fmt=":,.0f")
-fig_p95 = line_per_venue("p95_notional", "p95 trade $", "Hypothesis 3b: p95 trade size (whales) by minute-of-hour", hover_fmt=":,.0f")
-fig_imb = line_per_venue("imbalance_pct", "Imbalance %", "Hypothesis 4: Buy/sell imbalance by minute-of-hour", hover_fmt=":+.1f")
-fig_gap = line_per_venue("median_mark_gap", "Median |price−mark|", "Hypothesis 5: Mark-trade gap by minute-of-hour", hover_fmt=":,.4f")
+    filter_banner = ""
+    if exclude_hours:
+        filter_banner = (
+            f'<div class="box warn"><strong>Filtered view.</strong> Trades from ET hours '
+            f'<code>{sorted(exclude_hours)}</code> are excluded. These are CME WTI/Brent\'s daily '
+            f'<strong>17:00–18:00 ET maintenance window</strong> and the <strong>Sunday 18:00 ET reopen</strong> — '
+            f'the only "market-driven" hours inside our weekend collection window. '
+            f'Excluding them isolates pure weekend perp behaviour.</div>'
+        )
 
-heatmaps = {v: heatmap_for(v) for v in ["hyperliquid", "extended", "binance"]}
-fig_flush = flush_staircase()
-
-# ---- Render HTML ----
-def to_div(fig):
-    return fig.to_html(include_plotlyjs=False, full_html=False, div_id=None)
-
-summary_rows = "".join(
-    f"<tr><td>{row['venue']}</td><td>{row['asset_symbol']}</td>"
-    f"<td style='text-align:right'>{row['rows']:,}</td>"
-    f"<td>{row['first_trade_et']}</td><td>{row['last_trade_et']}</td></tr>"
-    for _, row in summary.iterrows()
-)
-
-html = f"""<!doctype html>
+    html = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<title>Minute-of-hour pattern report — 2026-04-25/26</title>
+<title>Minute-of-hour pattern report — 2026-04-25/26 {title_suffix}</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
   body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1.5em; color: #111; line-height: 1.55; }}
@@ -244,12 +290,14 @@ html = f"""<!doctype html>
 </style>
 </head><body>
 
-<h1>Does anything special happen at the 45th minute?</h1>
+<h1>Does anything special happen at the 45th minute? <span style="font-size:0.6em;color:#666;font-weight:normal">{title_suffix}</span></h1>
 <div class="meta">
   Hypothesis test using the last full collection window (Sat 2026-04-25 → Sun 2026-04-26 ET).
   The actual crash weekend (04-18/19) is not available — both HL parquet files were
   corrupted by the OOM and we have no replacement. This is a proxy.
 </div>
+
+{filter_banner}
 
 <div class="box">
   <strong>Background.</strong> The HL recorder crashed mid-Saturday at <code>09:44 ET</code>
@@ -301,10 +349,10 @@ not appear elsewhere on the curve.</p>
 <h3>H5 · Trade-vs-mark gap (proxy for stale-oracle moments)</h3>
 {to_div(fig_gap)}
 
-<h2>Section 2 · Hour×minute heatmaps</h2>
+<h2>Section 2 · Day×hour × minute heatmaps</h2>
 <p>If <code>:45</code> is special, every row of the heatmap should show a brighter column
 at minute 44–45. A vertical red dashed line marks <code>:44</code> and <code>:45</code>
-on each heatmap.</p>
+on each heatmap. Rows are labelled by day name and ET hour.</p>
 
 <h3>Hyperliquid (the venue that actually crashed)</h3>
 {to_div(heatmaps["hyperliquid"])}
@@ -352,6 +400,10 @@ selected by the flush schedule.</span></p>
 
 </body></html>
 """
+    out_path.write_text(html)
+    print(f"wrote {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
 
-OUT.write_text(html)
-print(f"wrote {OUT} ({OUT.stat().st_size / 1024:.1f} KB)")
+
+if __name__ == "__main__":
+    for mode in MODES:
+        build(mode["exclude_hours"], mode["out"], mode["title_suffix"])
