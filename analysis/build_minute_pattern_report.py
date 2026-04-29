@@ -15,6 +15,7 @@ Usage:
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 import plotly.graph_objects as go
 
 # Recorder collection window (recorder/window.py): Fri 16:00 ET → Sun 19:00 ET
@@ -39,26 +40,33 @@ VENUE_COLORS = {
     "binance": "#f59e0b",
 }
 
-# CME WTI/Brent: daily 17:00–18:00 ET maintenance window; Sunday reopen at 18:00 ET.
-# Within our data range (Sat 00:00 → Sun ~21:00 ET) those hours are the only
-# market-driven events. Filtering them isolates "pure weekend" perp behaviour.
+# Minutes-of-hour where H3 (avg / p95 trade size) shows visible spikes that
+# warrant a "what trades caused this?" diagnostic underneath. Add minutes here
+# to render an extra outlier table per minute.
+INSPECT_MINUTES = [27, 56]
+
+# CME WTI/Brent transitions inside our window (Fri 16:00 → Sun 19:00 ET):
+#   Fri 17:00 ET → market close.   Sun 18:00 ET → market reopen.
+# Sat is closed all day; Fri 18 & Sun 17 are quiet pre/post-CME hours — those
+# are still "pure weekend perp behaviour" and should NOT be filtered.
 MODES = [
     {
         "label": "all",
-        "exclude_hours": set(),
+        "exclude_day_hours": set(),
         "out": OUT_DIR / "minute_of_hour_pattern_2026-04-25_26.html",
         "title_suffix": "(all weekend hours)",
     },
     {
         "label": "filtered",
-        "exclude_hours": {17, 18},
+        # (day_name, hour_et) pairs — only the actual CME transition hours.
+        "exclude_day_hours": {("Friday", 17), ("Sunday", 18)},
         "out": OUT_DIR / "minute_of_hour_pattern_2026-04-25_26_filtered.html",
-        "title_suffix": "(CME open/close hours excluded — :17 and :18 ET hours dropped)",
+        "title_suffix": "(CME transition hours excluded — Fri 17 ET close & Sun 18 ET reopen)",
     },
 ]
 
 
-def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
+def build(exclude_day_hours: set[tuple[str, int]], out_path: Path, title_suffix: str):
     # Restrict to the recorder's intended collection window (Fri 16:00 ET →
     # Sun 19:00 ET, exclusive). Bounds applied in SQL on the ET timestamp so
     # this works regardless of file-name conventions.
@@ -66,10 +74,14 @@ def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
         f"((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')) >= TIMESTAMP '{WINDOW_START}'",
         f"((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')) <  TIMESTAMP '{WINDOW_END}'",
     ]
-    if exclude_hours:
+    if exclude_day_hours:
+        ts_et_expr = "(to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')"
+        excl_tuples = ", ".join(
+            f"('{day}', {hour})" for day, hour in sorted(exclude_day_hours)
+        )
         where_parts.append(
-            "EXTRACT(HOUR FROM ((to_timestamp(timestamp/1000.0) AT TIME ZONE 'America/New_York')))"
-            f" NOT IN ({','.join(str(h) for h in sorted(exclude_hours))})"
+            f"(dayname({ts_et_expr}), EXTRACT(HOUR FROM {ts_et_expr})::INT) "
+            f"NOT IN ({excl_tuples})"
         )
     excl_clause = "WHERE " + " AND ".join(where_parts)
 
@@ -195,8 +207,10 @@ def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
         fig.add_vline(x=44, line=dict(color="red", width=1, dash="dot"))
         fig.add_vline(x=45, line=dict(color="red", width=1, dash="dot"))
         excl_note = ""
-        if exclude_hours:
-            excl_note = f" — hours {sorted(exclude_hours)} ET excluded"
+        if exclude_day_hours:
+            excl_note = " — " + ", ".join(
+                f"{d[:3]} {h:02d} ET excluded" for d, h in sorted(exclude_day_hours)
+            )
         fig.update_layout(
             title=f"{venue} · trades per (day-hour-ET × minute-of-hour) — red lines mark :44, :45{excl_note}",
             xaxis_title="minute of hour", yaxis_title="day · hour (ET)",
@@ -248,6 +262,83 @@ def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
     heatmaps = {v: heatmap_for(v) for v in ["hyperliquid", "extended", "binance"]}
     fig_flush = flush_staircase()
 
+    # Diagnostic outlier tables — for each minute-of-hour the user flags as anomalous,
+    # show its top trades (across all venues) and a comparison of that minute's avg /
+    # p95 vs neighbouring minutes. This explains the H3 spikes inline.
+    def outlier_box(minute):
+        stats_df = con.execute(
+            f"""
+            SELECT minute_of_hour AS m, COUNT(*) AS n,
+                   ROUND(AVG(notional_usd)) AS avg_n,
+                   ROUND(QUANTILE_CONT(notional_usd, 0.95)) AS p95
+            FROM trades
+            WHERE minute_of_hour BETWEEN {minute - 2} AND {minute + 2}
+            GROUP BY minute_of_hour ORDER BY minute_of_hour
+            """
+        ).df()
+        # Top 3 per venue at this minute (ROW_NUMBER over the view triggers a
+        # DuckDB bind bug with our TIMESTAMPTZ-derived columns; do it in pandas).
+        all_at_min = con.execute(
+            f"""
+            SELECT ts_et, venue, asset_symbol, side, price,
+                   ROUND(notional_usd) AS notional, notional_usd AS _raw_notional
+            FROM trades
+            WHERE minute_of_hour = {minute}
+            ORDER BY notional_usd DESC
+            """
+        ).df()
+        if all_at_min.empty:
+            top_df = all_at_min
+        else:
+            top_df = (
+                all_at_min.sort_values("_raw_notional", ascending=False)
+                .groupby("venue", group_keys=False)
+                .head(3)
+                .sort_values(["venue", "_raw_notional"], ascending=[True, False])
+                .drop(columns=["_raw_notional"])
+            )
+        if top_df.empty:
+            return ""
+
+        stats_rows = "".join(
+            f"<tr{' class=hot' if int(r.m) == minute else ''}>"
+            f"<td>:{int(r.m):02d}</td><td>{int(r.n):,}</td>"
+            f"<td>${int(r.avg_n):,}</td><td>${int(r.p95):,}</td></tr>"
+            for r in stats_df.itertuples()
+        )
+        top_rows = "".join(
+            f"<tr><td>{pd.Timestamp(r.ts_et).strftime('%a %m-%d %H:%M:%S.%f')[:-3]}</td>"
+            f"<td>{r.venue}</td><td>{r.asset_symbol}</td>"
+            f"<td><span class='pill {r.side}'>{r.side}</span></td>"
+            f"<td style='text-align:right'>{r.price:.3f}</td>"
+            f"<td style='text-align:right'>${int(r.notional):,}</td></tr>"
+            for r in top_df.itertuples()
+        )
+        return f"""
+<div class="outlier-box">
+  <h4>Minute :{minute:02d} — what's driving the spike?</h4>
+  <div class="outlier-grid">
+    <div>
+      <div class="outlier-label">Avg + p95 vs ±2-min neighbours</div>
+      <table class="mini">
+        <thead><tr><th>Min</th><th>Trades</th><th>Avg $</th><th>p95 $</th></tr></thead>
+        <tbody>{stats_rows}</tbody>
+      </table>
+    </div>
+    <div>
+      <div class="outlier-label">Top 3 trades per venue at :{minute:02d} (any day)</div>
+      <table class="mini">
+        <thead><tr><th>Time (ET)</th><th>Venue</th><th>Asset</th><th>Side</th>
+          <th style='text-align:right'>Price</th><th style='text-align:right'>Notional</th></tr></thead>
+        <tbody>{top_rows}</tbody>
+      </table>
+    </div>
+  </div>
+</div>
+"""
+
+    inspect_html = "".join(outlier_box(m) for m in INSPECT_MINUTES)
+
     def to_div(fig):
         return fig.to_html(include_plotlyjs=False, full_html=False, div_id=None)
 
@@ -259,13 +350,15 @@ def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
     )
 
     filter_banner = ""
-    if exclude_hours:
+    if exclude_day_hours:
+        excl_human = ", ".join(
+            f"<code>{d} {h:02d}:00 ET</code>" for d, h in sorted(exclude_day_hours)
+        )
         filter_banner = (
-            f'<div class="box warn"><strong>Filtered view.</strong> Trades from ET hours '
-            f'<code>{sorted(exclude_hours)}</code> are excluded. These are CME WTI/Brent\'s daily '
-            f'<strong>17:00–18:00 ET maintenance window</strong> and the <strong>Sunday 18:00 ET reopen</strong> — '
-            f'the only "market-driven" hours inside our weekend collection window. '
-            f'Excluding them isolates pure weekend perp behaviour.</div>'
+            f'<div class="box warn"><strong>Filtered view.</strong> Trades from {excl_human} '
+            f'are excluded — these are the only CME transition hours inside the recorder\'s '
+            f'collection window (<strong>Fri 17:00 ET close</strong> and <strong>Sun 18:00 ET reopen</strong>). '
+            f'All other weekend hours (including Sat 17–18 ET, when CME is fully closed) are kept.</div>'
         )
 
     html = f"""<!doctype html>
@@ -286,6 +379,19 @@ def build(exclude_hours: set[int], out_path: Path, title_suffix: str):
   table.summary th, table.summary td {{ border: 1px solid #ddd; padding: 0.4em 0.8em; }}
   table.summary th {{ background: #f3f4f6; }}
   .hyp {{ font-weight: 600; color: #7c3aed; }}
+  .outlier-box {{ background: #fff8eb; border-left: 4px solid #f59e0b; border-radius: 4px;
+                  padding: 0.9em 1.2em; margin: 1em 0 1.5em; }}
+  .outlier-box h4 {{ margin: 0 0 0.6em; font-size: 0.98em; color: #92400e; }}
+  .outlier-grid {{ display: grid; grid-template-columns: 240px 1fr; gap: 1.5em; }}
+  .outlier-label {{ font-size: 0.78em; color: #666; text-transform: uppercase;
+                    letter-spacing: 0.06em; margin-bottom: 0.3em; }}
+  table.mini {{ border-collapse: collapse; width: 100%; font-size: 0.82em; }}
+  table.mini th, table.mini td {{ border: 1px solid #e5e7eb; padding: 0.25em 0.6em; text-align: left; }}
+  table.mini th {{ background: #fef3c7; font-weight: 600; }}
+  table.mini tr.hot td {{ background: #fef3c7; font-weight: 600; }}
+  .pill {{ display: inline-block; padding: 0px 6px; border-radius: 999px; font-size: 0.78em; font-weight: 600; }}
+  .pill.buy {{ background: #d1fae5; color: #065f46; }}
+  .pill.sell {{ background: #fee2e2; color: #991b1b; }}
   code {{ background: #f3f4f6; padding: 0.1em 0.4em; border-radius: 3px; font-size: 0.92em; }}
 </style>
 </head><body>
@@ -342,6 +448,7 @@ not appear elsewhere on the curve.</p>
 <h3>H3 · Trade size (avg + p95)</h3>
 {to_div(fig_avg)}
 {to_div(fig_p95)}
+{inspect_html}
 
 <h3>H4 · Buy/sell imbalance</h3>
 {to_div(fig_imb)}
@@ -406,4 +513,4 @@ selected by the flush schedule.</span></p>
 
 if __name__ == "__main__":
     for mode in MODES:
-        build(mode["exclude_hours"], mode["out"], mode["title_suffix"])
+        build(mode["exclude_day_hours"], mode["out"], mode["title_suffix"])
